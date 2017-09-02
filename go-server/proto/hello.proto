@@ -1,0 +1,17 @@
+
+syntax = "proto3";
+
+package proto;
+
+// The Hello service definition.
+service Hello {
+  rpc SayWorld (ReqSayWorld) returns (ReplySayWorld) {}
+}
+
+message ReqSayWorld {
+    string name = 1;
+}
+
+message ReplySayWorld {
+    string message = 1;
+}
