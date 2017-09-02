@@ -1,6 +1,11 @@
 # etcdnaming
 a tool which using ectd for some clients to find server when its started
 
+## etcd & grpc
+
+[ETCD Link](https://github.com/coreos/etcd)
+[GRPC Link](https://github.com/grpc/grpc-go)
+
 ## Server
 
 **[server example](go-server/main.go)**
