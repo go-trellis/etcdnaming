@@ -11,8 +11,7 @@ import (
 	"time"
 
 	"github.com/go-trellis/etcdnaming"
-	"github.com/go-trellis/etcdnaming/go-sever/proto"
-	uuid "github.com/satori/go.uuid"
+	"github.com/go-trellis/etcdnaming/go-server/proto"
 )
 
 var (
@@ -36,7 +35,7 @@ func main() {
 			return
 		}
 		resp, err := proto.NewHelloClient(conn).SayWorld(context.Background(),
-			&proto.ReqSayWorld{Name: "world " + *cli + " :" + uuid.NewV4().String()})
+			&proto.ReqSayWorld{Name: fmt.Sprintf("world %s: %d", *cli, time.Now().Nanosecond())})
 
 		if err == nil {
 			fmt.Printf("%v: Reply is %s\n", t, resp.Message)
