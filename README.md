@@ -3,8 +3,8 @@ a tool which using ectd for some clients to find server when its started
 
 ## etcd & grpc
 
-* [ETCD Link](https://github.com/coreos/etcd) | vendor version：v3.2.4
-* [GRPC Link](https://github.com/grpc/grpc-go) | vendor version：v1.5.1
+* [ETCD Link](https://github.com/coreos/etcd)  | vendor version：[v3.2.4](https://github.com/coreos/etcd/releases/tag/v3.2.4)
+* [GRPC Link](https://github.com/grpc/grpc-go) | vendor version：[v1.5.1](https://github.com/grpc/grpc-go/releases/tag/v1.5.1)
 
 ## Server
 
