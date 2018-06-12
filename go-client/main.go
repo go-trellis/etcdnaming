@@ -16,20 +16,23 @@ import (
 
 var (
 	name = flag.String("name", "hello", "service name")
+	ver  = flag.String("ver", "v0", "server's version")
 	cli  = flag.String("client", "1", "clinet name")
 	reg  = flag.String("reg", "http://127.0.0.1:2379", "register etcd address")
 )
 
 func main() {
 	flag.Parse()
-	err := etcdnaming.NewResolver(*name, *reg, 10*time.Second)
+	serverName := fmt.Sprintf("%s-%s", *name, *ver)
+	fmt.Println("connect to:", serverName)
+	err := etcdnaming.NewResolver(serverName, *reg, 10*time.Second)
 	if err != nil {
 		panic(err)
 	}
 
 	ticker := time.NewTicker(1000 * time.Millisecond)
 	for t := range ticker.C {
-		conn, ok := etcdnaming.GetResolverConn(*name)
+		conn, ok := etcdnaming.GetResolverConn(serverName)
 		if !ok {
 			fmt.Println("not get conn")
 			return

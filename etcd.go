@@ -43,16 +43,17 @@ type defaultServerRegister struct {
 // serv: server address host:port
 // interval: Rotation time to registe serv into etcd
 // ttl: expired time, seconds
-// registRetryTimes: allow failed to regist server and retry times
+// registRetryTimes: allow failed to regist server and retry times; -1 alaways retry
 type ServerRegisterConfig struct {
-	Name    string
-	Target  string
-	Service string // host & port
-
-	TTL      int
-	Interval time.Duration
-
+	Name             string
+	Target           string
+	Service          string // host & port
+	Version          string // server's version
+	TTL              int
+	Interval         time.Duration
 	RegistRetryTimes int
+
+	serverName string // name & version
 }
 
 const prefix = "etcd_naming"
@@ -63,13 +64,17 @@ func NewDefaultServerRegister(c ServerRegisterConfig) ServerRegister {
 	p := &defaultServerRegister{
 		src: c,
 
-		id:     fmt.Sprintf("%d-%d", time.Now().Unix(), rand.Intn(10000)),
-		prefix: prefix,
-
+		id:         fmt.Sprintf("%d-%d", time.Now().Unix(), rand.Intn(10000)),
+		prefix:     prefix,
 		stopSignal: make(chan bool, 1),
 		ticker:     time.NewTicker(c.Interval),
 	}
-	p.path = fmt.Sprintf("/%s/%s/%s", p.prefix, p.src.Name, p.src.Service)
+
+	p.src.serverName = fmt.Sprintf("%s-%s", p.src.Name, p.src.Version)
+	p.path = fmt.Sprintf("/%s/%s/%s",
+		p.prefix,
+		p.src.serverName,
+		p.src.Service)
 
 	return p
 }
