@@ -15,292 +15,280 @@
 package clientv3
 
 import (
+	"context"
+
 	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"golang.org/x/net/context"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-type rpcFunc func(ctx context.Context) error
-type retryRpcFunc func(context.Context, rpcFunc) error
-type retryStopErrFunc func(error) bool
+type retryPolicy uint8
 
-func isReadStopError(err error) bool {
+const (
+	repeatable retryPolicy = iota
+	nonRepeatable
+)
+
+func (rp retryPolicy) String() string {
+	switch rp {
+	case repeatable:
+		return "repeatable"
+	case nonRepeatable:
+		return "nonRepeatable"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// isSafeRetryImmutableRPC returns "true" when an immutable request is safe for retry.
+//
+// immutable requests (e.g. Get) should be retried unless it's
+// an obvious server-side error (e.g. rpctypes.ErrRequestTooLarge).
+//
+// Returning "false" means retry should stop, since client cannot
+// handle itself even with retries.
+func isSafeRetryImmutableRPC(err error) bool {
 	eErr := rpctypes.Error(err)
-	// always stop retry on etcd errors
-	if _, ok := eErr.(rpctypes.EtcdError); ok {
-		return true
+	if serverErr, ok := eErr.(rpctypes.EtcdError); ok && serverErr.Code() != codes.Unavailable {
+		// interrupted by non-transient server-side or gRPC-side error
+		// client cannot handle itself (e.g. rpctypes.ErrCompacted)
+		return false
 	}
 	// only retry if unavailable
-	return grpc.Code(err) != codes.Unavailable
-}
-
-func isWriteStopError(err error) bool {
-	return grpc.Code(err) != codes.Unavailable ||
-		grpc.ErrorDesc(err) != "there is no address available"
-}
-
-func (c *Client) newRetryWrapper(isStop retryStopErrFunc) retryRpcFunc {
-	return func(rpcCtx context.Context, f rpcFunc) error {
-		for {
-			if err := f(rpcCtx); err == nil || isStop(err) {
-				return err
-			}
-			select {
-			case <-c.balancer.ConnectNotify():
-			case <-rpcCtx.Done():
-				return rpcCtx.Err()
-			case <-c.ctx.Done():
-				return c.ctx.Err()
-			}
-		}
+	ev, ok := status.FromError(err)
+	if !ok {
+		// all errors from RPC is typed "grpc/status.(*statusError)"
+		// (ref. https://github.com/grpc/grpc-go/pull/1782)
+		//
+		// if the error type is not "grpc/status.(*statusError)",
+		// it could be from "Dial"
+		// TODO: do not retry for now
+		// ref. https://github.com/grpc/grpc-go/issues/1581
+		return false
 	}
+	return ev.Code() == codes.Unavailable
 }
 
-func (c *Client) newAuthRetryWrapper() retryRpcFunc {
-	return func(rpcCtx context.Context, f rpcFunc) error {
-		for {
-			err := f(rpcCtx)
-			if err == nil {
-				return nil
-			}
-
-			// always stop retry on etcd errors other than invalid auth token
-			if rpctypes.Error(err) == rpctypes.ErrInvalidAuthToken {
-				gterr := c.getToken(rpcCtx)
-				if gterr != nil {
-					return err // return the original error for simplicity
-				}
-				continue
-			}
-
-			return err
-		}
+// isSafeRetryMutableRPC returns "true" when a mutable request is safe for retry.
+//
+// mutable requests (e.g. Put, Delete, Txn) should only be retried
+// when the status code is codes.Unavailable when initial connection
+// has not been established (no endpoint is up).
+//
+// Returning "false" means retry should stop, otherwise it violates
+// write-at-most-once semantics.
+func isSafeRetryMutableRPC(err error) bool {
+	if ev, ok := status.FromError(err); ok && ev.Code() != codes.Unavailable {
+		// not safe for mutable RPCs
+		// e.g. interrupted by non-transient error that client cannot handle itself,
+		// or transient error while the connection has already been established
+		return false
 	}
-}
-
-// RetryKVClient implements a KVClient that uses the client's FailFast retry policy.
-func RetryKVClient(c *Client) pb.KVClient {
-	readRetry := c.newRetryWrapper(isReadStopError)
-	writeRetry := c.newRetryWrapper(isWriteStopError)
-	conn := pb.NewKVClient(c.conn)
-	retryBasic := &retryKVClient{&retryWriteKVClient{conn, writeRetry}, readRetry}
-	retryAuthWrapper := c.newAuthRetryWrapper()
-	return &retryKVClient{
-		&retryWriteKVClient{retryBasic, retryAuthWrapper},
-		retryAuthWrapper}
+	desc := rpctypes.ErrorDesc(err)
+	return desc == "there is no address available" || desc == "there is no connection available"
 }
 
 type retryKVClient struct {
-	*retryWriteKVClient
-	readRetry retryRpcFunc
+	kc pb.KVClient
 }
 
+// RetryKVClient implements a KVClient.
+func RetryKVClient(c *Client) pb.KVClient {
+	return &retryKVClient{
+		kc: pb.NewKVClient(c.conn),
+	}
+}
 func (rkv *retryKVClient) Range(ctx context.Context, in *pb.RangeRequest, opts ...grpc.CallOption) (resp *pb.RangeResponse, err error) {
-	err = rkv.readRetry(ctx, func(rctx context.Context) error {
-		resp, err = rkv.KVClient.Range(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rkv.kc.Range(ctx, in, append(opts, withRetryPolicy(repeatable))...)
 }
 
-type retryWriteKVClient struct {
-	pb.KVClient
-	retryf retryRpcFunc
+func (rkv *retryKVClient) Put(ctx context.Context, in *pb.PutRequest, opts ...grpc.CallOption) (resp *pb.PutResponse, err error) {
+	return rkv.kc.Put(ctx, in, opts...)
 }
 
-func (rkv *retryWriteKVClient) Put(ctx context.Context, in *pb.PutRequest, opts ...grpc.CallOption) (resp *pb.PutResponse, err error) {
-	err = rkv.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rkv.KVClient.Put(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+func (rkv *retryKVClient) DeleteRange(ctx context.Context, in *pb.DeleteRangeRequest, opts ...grpc.CallOption) (resp *pb.DeleteRangeResponse, err error) {
+	return rkv.kc.DeleteRange(ctx, in, opts...)
 }
 
-func (rkv *retryWriteKVClient) DeleteRange(ctx context.Context, in *pb.DeleteRangeRequest, opts ...grpc.CallOption) (resp *pb.DeleteRangeResponse, err error) {
-	err = rkv.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rkv.KVClient.DeleteRange(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+func (rkv *retryKVClient) Txn(ctx context.Context, in *pb.TxnRequest, opts ...grpc.CallOption) (resp *pb.TxnResponse, err error) {
+	return rkv.kc.Txn(ctx, in, opts...)
 }
 
-func (rkv *retryWriteKVClient) Txn(ctx context.Context, in *pb.TxnRequest, opts ...grpc.CallOption) (resp *pb.TxnResponse, err error) {
-	err = rkv.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rkv.KVClient.Txn(rctx, in, opts...)
-		return err
-	})
-	return resp, err
-}
-
-func (rkv *retryWriteKVClient) Compact(ctx context.Context, in *pb.CompactionRequest, opts ...grpc.CallOption) (resp *pb.CompactionResponse, err error) {
-	err = rkv.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rkv.KVClient.Compact(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+func (rkv *retryKVClient) Compact(ctx context.Context, in *pb.CompactionRequest, opts ...grpc.CallOption) (resp *pb.CompactionResponse, err error) {
+	return rkv.kc.Compact(ctx, in, opts...)
 }
 
 type retryLeaseClient struct {
-	pb.LeaseClient
-	retryf retryRpcFunc
+	lc pb.LeaseClient
 }
 
-// RetryLeaseClient implements a LeaseClient that uses the client's FailFast retry policy.
+// RetryLeaseClient implements a LeaseClient.
 func RetryLeaseClient(c *Client) pb.LeaseClient {
-	retry := &retryLeaseClient{
-		pb.NewLeaseClient(c.conn),
-		c.newRetryWrapper(isReadStopError),
+	return &retryLeaseClient{
+		lc: pb.NewLeaseClient(c.conn),
 	}
-	return &retryLeaseClient{retry, c.newAuthRetryWrapper()}
+}
+
+func (rlc *retryLeaseClient) LeaseTimeToLive(ctx context.Context, in *pb.LeaseTimeToLiveRequest, opts ...grpc.CallOption) (resp *pb.LeaseTimeToLiveResponse, err error) {
+	return rlc.lc.LeaseTimeToLive(ctx, in, append(opts, withRetryPolicy(repeatable))...)
+}
+
+func (rlc *retryLeaseClient) LeaseLeases(ctx context.Context, in *pb.LeaseLeasesRequest, opts ...grpc.CallOption) (resp *pb.LeaseLeasesResponse, err error) {
+	return rlc.lc.LeaseLeases(ctx, in, append(opts, withRetryPolicy(repeatable))...)
 }
 
 func (rlc *retryLeaseClient) LeaseGrant(ctx context.Context, in *pb.LeaseGrantRequest, opts ...grpc.CallOption) (resp *pb.LeaseGrantResponse, err error) {
-	err = rlc.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rlc.LeaseClient.LeaseGrant(rctx, in, opts...)
-		return err
-	})
-	return resp, err
-
+	return rlc.lc.LeaseGrant(ctx, in, append(opts, withRetryPolicy(repeatable))...)
 }
 
 func (rlc *retryLeaseClient) LeaseRevoke(ctx context.Context, in *pb.LeaseRevokeRequest, opts ...grpc.CallOption) (resp *pb.LeaseRevokeResponse, err error) {
-	err = rlc.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rlc.LeaseClient.LeaseRevoke(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rlc.lc.LeaseRevoke(ctx, in, append(opts, withRetryPolicy(repeatable))...)
+}
+
+func (rlc *retryLeaseClient) LeaseKeepAlive(ctx context.Context, opts ...grpc.CallOption) (stream pb.Lease_LeaseKeepAliveClient, err error) {
+	return rlc.lc.LeaseKeepAlive(ctx, append(opts, withRetryPolicy(repeatable))...)
 }
 
 type retryClusterClient struct {
-	pb.ClusterClient
-	retryf retryRpcFunc
+	cc pb.ClusterClient
 }
 
-// RetryClusterClient implements a ClusterClient that uses the client's FailFast retry policy.
+// RetryClusterClient implements a ClusterClient.
 func RetryClusterClient(c *Client) pb.ClusterClient {
-	return &retryClusterClient{pb.NewClusterClient(c.conn), c.newRetryWrapper(isWriteStopError)}
+	return &retryClusterClient{
+		cc: pb.NewClusterClient(c.conn),
+	}
+}
+
+func (rcc *retryClusterClient) MemberList(ctx context.Context, in *pb.MemberListRequest, opts ...grpc.CallOption) (resp *pb.MemberListResponse, err error) {
+	return rcc.cc.MemberList(ctx, in, append(opts, withRetryPolicy(repeatable))...)
 }
 
 func (rcc *retryClusterClient) MemberAdd(ctx context.Context, in *pb.MemberAddRequest, opts ...grpc.CallOption) (resp *pb.MemberAddResponse, err error) {
-	err = rcc.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rcc.ClusterClient.MemberAdd(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rcc.cc.MemberAdd(ctx, in, opts...)
 }
 
 func (rcc *retryClusterClient) MemberRemove(ctx context.Context, in *pb.MemberRemoveRequest, opts ...grpc.CallOption) (resp *pb.MemberRemoveResponse, err error) {
-	err = rcc.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rcc.ClusterClient.MemberRemove(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rcc.cc.MemberRemove(ctx, in, opts...)
 }
 
 func (rcc *retryClusterClient) MemberUpdate(ctx context.Context, in *pb.MemberUpdateRequest, opts ...grpc.CallOption) (resp *pb.MemberUpdateResponse, err error) {
-	err = rcc.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rcc.ClusterClient.MemberUpdate(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rcc.cc.MemberUpdate(ctx, in, opts...)
+}
+
+type retryMaintenanceClient struct {
+	mc pb.MaintenanceClient
+}
+
+// RetryMaintenanceClient implements a Maintenance.
+func RetryMaintenanceClient(c *Client, conn *grpc.ClientConn) pb.MaintenanceClient {
+	return &retryMaintenanceClient{
+		mc: pb.NewMaintenanceClient(conn),
+	}
+}
+
+func (rmc *retryMaintenanceClient) Alarm(ctx context.Context, in *pb.AlarmRequest, opts ...grpc.CallOption) (resp *pb.AlarmResponse, err error) {
+	return rmc.mc.Alarm(ctx, in, append(opts, withRetryPolicy(repeatable))...)
+}
+
+func (rmc *retryMaintenanceClient) Status(ctx context.Context, in *pb.StatusRequest, opts ...grpc.CallOption) (resp *pb.StatusResponse, err error) {
+	return rmc.mc.Status(ctx, in, append(opts, withRetryPolicy(repeatable))...)
+}
+
+func (rmc *retryMaintenanceClient) Hash(ctx context.Context, in *pb.HashRequest, opts ...grpc.CallOption) (resp *pb.HashResponse, err error) {
+	return rmc.mc.Hash(ctx, in, append(opts, withRetryPolicy(repeatable))...)
+}
+
+func (rmc *retryMaintenanceClient) HashKV(ctx context.Context, in *pb.HashKVRequest, opts ...grpc.CallOption) (resp *pb.HashKVResponse, err error) {
+	return rmc.mc.HashKV(ctx, in, append(opts, withRetryPolicy(repeatable))...)
+}
+
+func (rmc *retryMaintenanceClient) Snapshot(ctx context.Context, in *pb.SnapshotRequest, opts ...grpc.CallOption) (stream pb.Maintenance_SnapshotClient, err error) {
+	return rmc.mc.Snapshot(ctx, in, append(opts, withRetryPolicy(repeatable))...)
+}
+
+func (rmc *retryMaintenanceClient) MoveLeader(ctx context.Context, in *pb.MoveLeaderRequest, opts ...grpc.CallOption) (resp *pb.MoveLeaderResponse, err error) {
+	return rmc.mc.MoveLeader(ctx, in, append(opts, withRetryPolicy(repeatable))...)
+}
+
+func (rmc *retryMaintenanceClient) Defragment(ctx context.Context, in *pb.DefragmentRequest, opts ...grpc.CallOption) (resp *pb.DefragmentResponse, err error) {
+	return rmc.mc.Defragment(ctx, in, opts...)
 }
 
 type retryAuthClient struct {
-	pb.AuthClient
-	retryf retryRpcFunc
+	ac pb.AuthClient
 }
 
-// RetryAuthClient implements a AuthClient that uses the client's FailFast retry policy.
+// RetryAuthClient implements a AuthClient.
 func RetryAuthClient(c *Client) pb.AuthClient {
-	return &retryAuthClient{pb.NewAuthClient(c.conn), c.newRetryWrapper(isWriteStopError)}
+	return &retryAuthClient{
+		ac: pb.NewAuthClient(c.conn),
+	}
+}
+
+func (rac *retryAuthClient) UserList(ctx context.Context, in *pb.AuthUserListRequest, opts ...grpc.CallOption) (resp *pb.AuthUserListResponse, err error) {
+	return rac.ac.UserList(ctx, in, append(opts, withRetryPolicy(repeatable))...)
+}
+
+func (rac *retryAuthClient) UserGet(ctx context.Context, in *pb.AuthUserGetRequest, opts ...grpc.CallOption) (resp *pb.AuthUserGetResponse, err error) {
+	return rac.ac.UserGet(ctx, in, append(opts, withRetryPolicy(repeatable))...)
+}
+
+func (rac *retryAuthClient) RoleGet(ctx context.Context, in *pb.AuthRoleGetRequest, opts ...grpc.CallOption) (resp *pb.AuthRoleGetResponse, err error) {
+	return rac.ac.RoleGet(ctx, in, append(opts, withRetryPolicy(repeatable))...)
+}
+
+func (rac *retryAuthClient) RoleList(ctx context.Context, in *pb.AuthRoleListRequest, opts ...grpc.CallOption) (resp *pb.AuthRoleListResponse, err error) {
+	return rac.ac.RoleList(ctx, in, append(opts, withRetryPolicy(repeatable))...)
 }
 
 func (rac *retryAuthClient) AuthEnable(ctx context.Context, in *pb.AuthEnableRequest, opts ...grpc.CallOption) (resp *pb.AuthEnableResponse, err error) {
-	err = rac.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rac.AuthClient.AuthEnable(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rac.ac.AuthEnable(ctx, in, opts...)
 }
 
 func (rac *retryAuthClient) AuthDisable(ctx context.Context, in *pb.AuthDisableRequest, opts ...grpc.CallOption) (resp *pb.AuthDisableResponse, err error) {
-	err = rac.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rac.AuthClient.AuthDisable(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rac.ac.AuthDisable(ctx, in, opts...)
 }
 
 func (rac *retryAuthClient) UserAdd(ctx context.Context, in *pb.AuthUserAddRequest, opts ...grpc.CallOption) (resp *pb.AuthUserAddResponse, err error) {
-	err = rac.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rac.AuthClient.UserAdd(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rac.ac.UserAdd(ctx, in, opts...)
 }
 
 func (rac *retryAuthClient) UserDelete(ctx context.Context, in *pb.AuthUserDeleteRequest, opts ...grpc.CallOption) (resp *pb.AuthUserDeleteResponse, err error) {
-	err = rac.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rac.AuthClient.UserDelete(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rac.ac.UserDelete(ctx, in, opts...)
 }
 
 func (rac *retryAuthClient) UserChangePassword(ctx context.Context, in *pb.AuthUserChangePasswordRequest, opts ...grpc.CallOption) (resp *pb.AuthUserChangePasswordResponse, err error) {
-	err = rac.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rac.AuthClient.UserChangePassword(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rac.ac.UserChangePassword(ctx, in, opts...)
 }
 
 func (rac *retryAuthClient) UserGrantRole(ctx context.Context, in *pb.AuthUserGrantRoleRequest, opts ...grpc.CallOption) (resp *pb.AuthUserGrantRoleResponse, err error) {
-	err = rac.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rac.AuthClient.UserGrantRole(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rac.ac.UserGrantRole(ctx, in, opts...)
 }
 
 func (rac *retryAuthClient) UserRevokeRole(ctx context.Context, in *pb.AuthUserRevokeRoleRequest, opts ...grpc.CallOption) (resp *pb.AuthUserRevokeRoleResponse, err error) {
-	err = rac.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rac.AuthClient.UserRevokeRole(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rac.ac.UserRevokeRole(ctx, in, opts...)
 }
 
 func (rac *retryAuthClient) RoleAdd(ctx context.Context, in *pb.AuthRoleAddRequest, opts ...grpc.CallOption) (resp *pb.AuthRoleAddResponse, err error) {
-	err = rac.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rac.AuthClient.RoleAdd(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rac.ac.RoleAdd(ctx, in, opts...)
 }
 
 func (rac *retryAuthClient) RoleDelete(ctx context.Context, in *pb.AuthRoleDeleteRequest, opts ...grpc.CallOption) (resp *pb.AuthRoleDeleteResponse, err error) {
-	err = rac.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rac.AuthClient.RoleDelete(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rac.ac.RoleDelete(ctx, in, opts...)
 }
 
 func (rac *retryAuthClient) RoleGrantPermission(ctx context.Context, in *pb.AuthRoleGrantPermissionRequest, opts ...grpc.CallOption) (resp *pb.AuthRoleGrantPermissionResponse, err error) {
-	err = rac.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rac.AuthClient.RoleGrantPermission(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rac.ac.RoleGrantPermission(ctx, in, opts...)
 }
 
 func (rac *retryAuthClient) RoleRevokePermission(ctx context.Context, in *pb.AuthRoleRevokePermissionRequest, opts ...grpc.CallOption) (resp *pb.AuthRoleRevokePermissionResponse, err error) {
-	err = rac.retryf(ctx, func(rctx context.Context) error {
-		resp, err = rac.AuthClient.RoleRevokePermission(rctx, in, opts...)
-		return err
-	})
-	return resp, err
+	return rac.ac.RoleRevokePermission(ctx, in, opts...)
+}
+
+func (rac *retryAuthClient) Authenticate(ctx context.Context, in *pb.AuthenticateRequest, opts ...grpc.CallOption) (resp *pb.AuthenticateResponse, err error) {
+	return rac.ac.Authenticate(ctx, in, opts...)
 }

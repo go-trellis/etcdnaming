@@ -1,5 +1,4 @@
 // GNU GPL v3 License
-
 // Copyright (c) 2017 github.com:go-trellis
 
 package etcdnaming
@@ -9,9 +8,9 @@ import (
 	etcdNaming "github.com/coreos/etcd/clientv3/naming"
 	"github.com/coreos/etcd/mvcc/mvccpb"
 	"golang.org/x/net/context"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/naming"
+	"google.golang.org/grpc/status"
 )
 
 // watcher is the implementaion of grpc.naming.Watcher
@@ -39,7 +38,7 @@ func (w *watcher) Next() ([]*naming.Update, error) {
 	// process new events on target/*
 	wr, ok := <-w.wch
 	if !ok {
-		w.err = grpc.Errorf(codes.Unavailable, "%s", etcdNaming.ErrWatcherClosed)
+		w.err = status.Errorf(codes.Unavailable, "%s", etcdNaming.ErrWatcherClosed)
 		return nil, w.err
 	}
 	if w.err = wr.Err(); w.err != nil {

@@ -15,11 +15,12 @@
 package clientv3
 
 import (
+	"context"
+	"fmt"
 	"io"
 
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
 
@@ -39,7 +40,7 @@ type Maintenance interface {
 	// AlarmDisarm disarms a given alarm.
 	AlarmDisarm(ctx context.Context, m *AlarmMember) (*AlarmResponse, error)
 
-	// Defragment defragments storage backend of the etcd member with given endpoint.
+	// Defragment releases wasted space from internal fragmentation on a given etcd member.
 	// Defragment is only needed when deleting a large number of keys and want to reclaim
 	// the resources.
 	// Defragment is an expensive operation. User should avoid defragmenting multiple members
@@ -56,7 +57,9 @@ type Maintenance interface {
 	// is non-zero, the hash is computed on all keys at or below the given revision.
 	HashKV(ctx context.Context, endpoint string, rev int64) (*HashKVResponse, error)
 
-	// Snapshot provides a reader for a snapshot of a backend.
+	// Snapshot provides a reader for a point-in-time snapshot of etcd.
+	// If the context "ctx" is canceled or timed out, reading from returned
+	// "io.ReadCloser" would error out (e.g. context.Canceled, context.DeadlineExceeded).
 	Snapshot(ctx context.Context) (io.ReadCloser, error)
 
 	// MoveLeader requests current leader to transfer its leadership to the transferee.
@@ -65,31 +68,40 @@ type Maintenance interface {
 }
 
 type maintenance struct {
-	dial   func(endpoint string) (pb.MaintenanceClient, func(), error)
-	remote pb.MaintenanceClient
+	dial     func(endpoint string) (pb.MaintenanceClient, func(), error)
+	remote   pb.MaintenanceClient
+	callOpts []grpc.CallOption
 }
 
 func NewMaintenance(c *Client) Maintenance {
-	return &maintenance{
+	api := &maintenance{
 		dial: func(endpoint string) (pb.MaintenanceClient, func(), error) {
-			conn, err := c.dial(endpoint)
+			conn, err := c.Dial(endpoint)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, fmt.Errorf("failed to dial endpoint %s with maintenance client: %v", endpoint, err)
 			}
 			cancel := func() { conn.Close() }
-			return pb.NewMaintenanceClient(conn), cancel, nil
+			return RetryMaintenanceClient(c, conn), cancel, nil
 		},
-		remote: pb.NewMaintenanceClient(c.conn),
+		remote: RetryMaintenanceClient(c, c.conn),
 	}
+	if c != nil {
+		api.callOpts = c.callOpts
+	}
+	return api
 }
 
-func NewMaintenanceFromMaintenanceClient(remote pb.MaintenanceClient) Maintenance {
-	return &maintenance{
+func NewMaintenanceFromMaintenanceClient(remote pb.MaintenanceClient, c *Client) Maintenance {
+	api := &maintenance{
 		dial: func(string) (pb.MaintenanceClient, func(), error) {
 			return remote, func() {}, nil
 		},
 		remote: remote,
 	}
+	if c != nil {
+		api.callOpts = c.callOpts
+	}
+	return api
 }
 
 func (m *maintenance) AlarmList(ctx context.Context) (*AlarmResponse, error) {
@@ -98,15 +110,11 @@ func (m *maintenance) AlarmList(ctx context.Context) (*AlarmResponse, error) {
 		MemberID: 0,                 // all
 		Alarm:    pb.AlarmType_NONE, // all
 	}
-	for {
-		resp, err := m.remote.Alarm(ctx, req, grpc.FailFast(false))
-		if err == nil {
-			return (*AlarmResponse)(resp), nil
-		}
-		if isHaltErr(ctx, err) {
-			return nil, toErr(ctx, err)
-		}
+	resp, err := m.remote.Alarm(ctx, req, m.callOpts...)
+	if err == nil {
+		return (*AlarmResponse)(resp), nil
 	}
+	return nil, toErr(ctx, err)
 }
 
 func (m *maintenance) AlarmDisarm(ctx context.Context, am *AlarmMember) (*AlarmResponse, error) {
@@ -132,7 +140,7 @@ func (m *maintenance) AlarmDisarm(ctx context.Context, am *AlarmMember) (*AlarmR
 		return &ret, nil
 	}
 
-	resp, err := m.remote.Alarm(ctx, req, grpc.FailFast(false))
+	resp, err := m.remote.Alarm(ctx, req, m.callOpts...)
 	if err == nil {
 		return (*AlarmResponse)(resp), nil
 	}
@@ -145,7 +153,7 @@ func (m *maintenance) Defragment(ctx context.Context, endpoint string) (*Defragm
 		return nil, toErr(ctx, err)
 	}
 	defer cancel()
-	resp, err := remote.Defragment(ctx, &pb.DefragmentRequest{}, grpc.FailFast(false))
+	resp, err := remote.Defragment(ctx, &pb.DefragmentRequest{}, m.callOpts...)
 	if err != nil {
 		return nil, toErr(ctx, err)
 	}
@@ -158,7 +166,7 @@ func (m *maintenance) Status(ctx context.Context, endpoint string) (*StatusRespo
 		return nil, toErr(ctx, err)
 	}
 	defer cancel()
-	resp, err := remote.Status(ctx, &pb.StatusRequest{}, grpc.FailFast(false))
+	resp, err := remote.Status(ctx, &pb.StatusRequest{}, m.callOpts...)
 	if err != nil {
 		return nil, toErr(ctx, err)
 	}
@@ -168,10 +176,11 @@ func (m *maintenance) Status(ctx context.Context, endpoint string) (*StatusRespo
 func (m *maintenance) HashKV(ctx context.Context, endpoint string, rev int64) (*HashKVResponse, error) {
 	remote, cancel, err := m.dial(endpoint)
 	if err != nil {
+
 		return nil, toErr(ctx, err)
 	}
 	defer cancel()
-	resp, err := remote.HashKV(ctx, &pb.HashKVRequest{Revision: rev}, grpc.FailFast(false))
+	resp, err := remote.HashKV(ctx, &pb.HashKVRequest{Revision: rev}, m.callOpts...)
 	if err != nil {
 		return nil, toErr(ctx, err)
 	}
@@ -179,7 +188,7 @@ func (m *maintenance) HashKV(ctx context.Context, endpoint string, rev int64) (*
 }
 
 func (m *maintenance) Snapshot(ctx context.Context) (io.ReadCloser, error) {
-	ss, err := m.remote.Snapshot(ctx, &pb.SnapshotRequest{}, grpc.FailFast(false))
+	ss, err := m.remote.Snapshot(ctx, &pb.SnapshotRequest{}, append(m.callOpts, withMax(defaultStreamMaxRetries))...)
 	if err != nil {
 		return nil, toErr(ctx, err)
 	}
@@ -202,10 +211,20 @@ func (m *maintenance) Snapshot(ctx context.Context) (io.ReadCloser, error) {
 		}
 		pw.Close()
 	}()
-	return pr, nil
+	return &snapshotReadCloser{ctx: ctx, ReadCloser: pr}, nil
+}
+
+type snapshotReadCloser struct {
+	ctx context.Context
+	io.ReadCloser
+}
+
+func (rc *snapshotReadCloser) Read(p []byte) (n int, err error) {
+	n, err = rc.ReadCloser.Read(p)
+	return n, toErr(rc.ctx, err)
 }
 
 func (m *maintenance) MoveLeader(ctx context.Context, transfereeID uint64) (*MoveLeaderResponse, error) {
-	resp, err := m.remote.MoveLeader(ctx, &pb.MoveLeaderRequest{TargetID: transfereeID}, grpc.FailFast(false))
+	resp, err := m.remote.MoveLeader(ctx, &pb.MoveLeaderRequest{TargetID: transfereeID}, m.callOpts...)
 	return (*MoveLeaderResponse)(resp), toErr(ctx, err)
 }

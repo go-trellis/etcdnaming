@@ -3,8 +3,28 @@ a tool which using ectd for some clients to find server when its started
 
 ## etcd & grpc
 
-* [ETCD Link](https://github.com/coreos/etcd)  | vendor version：[v3.2.4](https://github.com/coreos/etcd/releases/tag/v3.2.4)
-* [GRPC Link](https://github.com/grpc/grpc-go) | vendor version：[v1.5.1](https://github.com/grpc/grpc-go/releases/tag/v1.5.1)
+* [ETCD Link](https://github.com/coreos/etcd)  | vendor version：[v3.3.18](https://github.com/coreos/etcd/releases/tag/v3.3.18)
+* [GRPC Link](https://github.com/grpc/grpc-go) | vendor version：[v1.26.0](https://github.com/grpc/grpc-go/releases/tag/v1.26.0)
+
+## installation
+
+* fisrt
+
+```golang
+go get github.com/coreos/go-systemd
+```
+
+* than: added this into go.mod
+
+```
+replace github.com/coreos/go-systemd => $GOPATH/src/github.com/coreos/go-systemd
+```
+
+* last:
+
+```golang
+go get github.com/go-trellis/etcdnaming
+```
 
 ## Server
 
@@ -19,7 +39,6 @@ type ServerRegister interface {
 	Revoke() error
 }
 ```
-
 
 ## Client
 

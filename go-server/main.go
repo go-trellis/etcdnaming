@@ -71,7 +71,7 @@ func main() {
 
 	// getting stop message and revoke etcd
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGKILL, syscall.SIGHUP, syscall.SIGQUIT)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
 	go func() {
 		message := <-ch
 		log.Printf("receive signal '%v'", message)

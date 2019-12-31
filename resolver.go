@@ -1,5 +1,4 @@
 // GNU GPL v3 License
-
 // Copyright (c) 2017 github.com:go-trellis
 
 package etcdnaming
@@ -17,7 +16,7 @@ import (
 	"google.golang.org/grpc/naming"
 )
 
-var defaultMapResolvers = &mapResolvers{Resolvers: make(map[string]*Resolver, 0)}
+var defaultMapResolvers = &mapResolvers{Resolvers: make(map[string]*Resolver)}
 
 type mapResolvers struct {
 	Resolvers map[string]*Resolver
@@ -57,10 +56,6 @@ func GetResolverConn(name string) (*grpc.ClientConn, bool) {
 type Resolver struct {
 	// service name to resolve
 	serviceName string
-	// etcd target
-	etcdTarget string
-	// timeout
-	timeout time.Duration
 	// grpc conn
 	client *clientv3.Client
 
