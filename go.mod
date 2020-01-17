@@ -2,6 +2,7 @@ module github.com/go-trellis/etcdnaming
 
 go 1.13
 
+replace github.com/coreos/go-systemd => /Users/huanghonghu/Documents/golang/src/github.com/coreos/go-systemd
 
 require (
 	github.com/coreos/etcd v3.3.18+incompatible
@@ -11,6 +12,6 @@ require (
 	github.com/golang/protobuf v1.3.2
 	github.com/google/uuid v1.1.1 // indirect
 	go.uber.org/zap v1.13.0 // indirect
-	golang.org/x/net v0.0.0-20191209160850-c0dbc17a3553
+	golang.org/x/net v0.0.0-20200114155413-6afb5195e5aa
 	google.golang.org/grpc v1.26.0
 )
