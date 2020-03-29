@@ -12,14 +12,10 @@ a tool which using ectd for some clients to find server when its started
 
 github.com/coreos/go-systemd v22.0.0
 
-```golang
-go get github.com/coreos/go-systemd
-```
-
 * than: added this into go.mod
 
 ```
-replace github.com/coreos/go-systemd => $GOPATH/src/github.com/coreos/go-systemd
+replace github.com/coreos/go-systemd => github.com/coreos/go-systemd/v22 v22.0.0
 ```
 
 * last:
