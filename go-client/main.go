@@ -37,7 +37,12 @@ func main() {
 	flag.Parse()
 	fmt.Println("connect to:", *name, *ver)
 
-	etcdnaming.NewBuilder(*name, *ver, *reg)
+	etcdnaming.NewBuilder(etcdnaming.BuilderOptions{
+		Server:     *name,
+		Version:    *ver,
+		Endpoint:   *reg,
+		LooperTime: 5 * time.Second,
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()

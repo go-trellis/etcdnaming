@@ -23,19 +23,21 @@ func (p *etcdBuilder) Build(
 
 	// generate etcd client
 	client, err := clientv3.New(clientv3.Config{
-		Endpoints: strings.Split(p.endpoint, ","),
+		Endpoints: strings.Split(p.opts.Endpoint, ","),
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	r := &etcdResolver{
+		opts: p.opts,
+
 		client: client,
 		cc:     cc,
 		target: target,
 		rn:     make(chan struct{}, 1),
 
-		key: fmt.Sprintf("/%s/%s/%s", p.Scheme(), p.server, p.version),
+		key: fmt.Sprintf("/%s/%s/%s", p.Scheme(), p.opts.Server, p.opts.Version),
 	}
 
 	r.ctx, r.cancel = context.WithCancel(context.Background())
@@ -68,7 +70,7 @@ func (p *etcdResolver) watcher() {
 		Addresses: addrs,
 	})
 	rch := p.client.Watch(context.Background(), p.key, clientv3.WithPrefix(), clientv3.WithRev(resp.Header.Revision+1))
-	t := time.NewTimer(minEtcdResRate)
+	t := time.NewTimer(p.opts.LooperTime)
 	for {
 
 		select {

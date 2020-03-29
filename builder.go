@@ -12,19 +12,21 @@ import (
 	"google.golang.org/grpc/resolver"
 )
 
-var minEtcdResRate = 10 * time.Second
+const (
+	schema = "etcdnaming"
 
-const schema = "etcdnaming"
+	// DialTarget 访问目标
+	DialTarget = schema + ":///"
+)
 
 type etcdBuilder struct {
-	server   string
-	version  string
-	endpoint string
+	opts BuilderOptions
 }
+
 type etcdResolver struct {
+	opts BuilderOptions
 	// grpc conn
 	client *clientv3.Client
-
 	ctx    context.Context
 	cancel context.CancelFunc
 	cc     resolver.ClientConn
@@ -35,12 +37,18 @@ type etcdResolver struct {
 	rn chan struct{}
 }
 
+// BuilderOptions builder's configure
+type BuilderOptions struct {
+	Server     string
+	Version    string
+	Endpoint   string
+	LooperTime time.Duration
+}
+
 // NewBuilder 获取builder
-func NewBuilder(server, version, endpoint string) {
+func NewBuilder(opt BuilderOptions) {
 	b := &etcdBuilder{
-		server:   server,
-		version:  version,
-		endpoint: endpoint,
+		opts: opt,
 	}
 
 	resolver.Register(b)
@@ -57,7 +65,7 @@ func Dial(opts ...grpc.DialOption) (*grpc.ClientConn, error) {
 
 // DialContext 带上下文的拨号
 func DialContext(ctx context.Context, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
-	c, err := grpc.DialContext(ctx, "etcdnaming:///", opts...)
+	c, err := grpc.DialContext(ctx, DialTarget, opts...)
 	if err != nil {
 		return nil, err
 	}
