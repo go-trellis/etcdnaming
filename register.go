@@ -5,12 +5,51 @@ package etcdnaming
 
 import (
 	"fmt"
+	"math/rand"
 	"strings"
+	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
+	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/etcdserver/api/v3rpc/rpctypes"
 	"golang.org/x/net/context"
 )
+
+// defaultServerRegister default server register
+type defaultServerRegister struct {
+	src ServerRegisterConfig
+
+	id string
+	// prefix should start and end with no slash
+	prefix string
+	// invoke self-register with ticker
+	ticker *time.Ticker
+	// etcd key path
+	path string
+
+	client *clientv3.Client
+
+	stopSignal chan bool
+}
+
+// NewDefaultServerRegister instance of server regitster
+func NewDefaultServerRegister(c ServerRegisterConfig) ServerRegister {
+	rand.Seed(time.Now().Unix())
+	p := &defaultServerRegister{
+		src: c,
+
+		id:         fmt.Sprintf("%d-%d", time.Now().Unix(), rand.Intn(10000)),
+		prefix:     fmt.Sprintf("/%s", schema),
+		stopSignal: make(chan bool, 1),
+		ticker:     time.NewTicker(c.Interval),
+	}
+
+	p.src.serverName = fmt.Sprintf("%s/%s", p.src.Name, p.src.Version)
+	p.path = fmt.Sprintf("%s/%s/%s",
+		p.prefix,
+		p.src.serverName,
+		p.src.Service)
+	return p
+}
 
 // Regist server regist into etcd
 func (p *defaultServerRegister) Regist() (err error) {
@@ -52,7 +91,7 @@ func (p *defaultServerRegister) regist() (err error) {
 	// minimum lease TTL is ttl-second
 	ctxGrant, cGrant := context.WithTimeout(context.TODO(), p.src.Interval)
 	defer cGrant()
-	resp, ie := p.client.Grant(ctxGrant, int64(p.src.TTL))
+	resp, ie := p.client.Grant(ctxGrant, int64(p.src.TTL/time.Second))
 	if ie != nil {
 		return fmt.Errorf("grpclib: set service %q with ttl to clientv3 failed: %s", p.src.Name, ie.Error())
 	}

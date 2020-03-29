@@ -25,25 +25,21 @@ import (
 var (
 	name = flag.String("name", "hello", "service name")
 	ver  = flag.String("ver", "v0", "server's version")
-	serv = flag.String("serv", "127.0.0.1", "service listen address")
-	port = flag.Int("port", 8001, "listening port")
+	serv = flag.String("serv", "127.0.0.1:8001", "service listen address")
 	reg  = flag.String("reg", "http://127.0.0.1:2379", "register etcd address")
 )
 
 type server struct{}
 
 func (*server) SayWorld(_ context.Context, req *proto.ReqSayWorld) (resp *proto.ReplySayWorld, err error) {
-	fmt.Println("i am address", *serv, *port)
 	fmt.Println("hello:", req.GetName())
-	return &proto.ReplySayWorld{Message: "ok"}, nil
+	return &proto.ReplySayWorld{Message: *serv + " ok"}, nil
 }
 
 func main() {
 	flag.Parse()
 
-	ser := fmt.Sprintf("%s:%d", *serv, *port)
-
-	lis, err := net.Listen("tcp", ser)
+	lis, err := net.Listen("tcp", *serv)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
@@ -51,11 +47,11 @@ func main() {
 	register := etcdnaming.NewDefaultServerRegister(etcdnaming.ServerRegisterConfig{
 		Name:    *name,
 		Target:  *reg,
-		Service: ser,
+		Service: *serv,
 		Version: *ver,
 
 		Interval: time.Second * 5,
-		TTL:      8,
+		TTL:      time.Second * 8,
 
 		RegistRetryTimes: 1,
 	})

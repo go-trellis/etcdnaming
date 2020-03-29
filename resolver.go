@@ -4,109 +4,105 @@
 package etcdnaming
 
 import (
-	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
+	"github.com/coreos/etcd/mvcc/mvccpb"
+	"go.etcd.io/etcd/clientv3"
 	"golang.org/x/net/context"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/naming"
+	"google.golang.org/grpc/resolver"
 )
 
-var defaultMapResolvers = &mapResolvers{Resolvers: make(map[string]*Resolver)}
+// Build 生成resolver
+func (p *etcdBuilder) Build(
+	target resolver.Target,
+	cc resolver.ClientConn,
+	opts resolver.BuildOptions,
+) (resolver.Resolver, error) {
 
-type mapResolvers struct {
-	Resolvers map[string]*Resolver
-	locker    sync.RWMutex
-}
-
-func (p *mapResolvers) getResolvers(name string) (*Resolver, bool) {
-	p.locker.RLock()
-	defer p.locker.RUnlock()
-	r, ok := p.Resolvers[name]
-	if ok {
-		return r, true
-	}
-	return nil, false
-}
-
-func (p *mapResolvers) setResolvers(name string, r *Resolver) bool {
-	p.locker.Lock()
-	defer p.locker.Unlock()
-	p.Resolvers[name] = r
-	return true
-}
-
-// GetResolverConn get resolver connection
-func GetResolverConn(name string) (*grpc.ClientConn, bool) {
-	r, ok := defaultMapResolvers.getResolvers(name)
-	if !ok {
-		return nil, false
-	}
-	if r.conn == nil {
-		return nil, false
-	}
-	return r.conn, true
-}
-
-// Resolver is the implementaion of grpc.naming.Resolver
-type Resolver struct {
-	// service name to resolve
-	serviceName string
-	// grpc conn
-	client *clientv3.Client
-
-	cancel context.CancelFunc
-	conn   *grpc.ClientConn
-}
-
-// NewResolver return resolver with service name
-// serviceName server's name
-// target: etcd client server address
-func NewResolver(serviceName, target string, timeout time.Duration) error {
-
-	if _, ok := defaultMapResolvers.getResolvers(serviceName); ok {
-		return nil
-	}
 	// generate etcd client
 	client, err := clientv3.New(clientv3.Config{
-		Endpoints: strings.Split(target, ","),
+		Endpoints: strings.Split(p.endpoint, ","),
 	})
 	if err != nil {
-		return fmt.Errorf("grpclib: creat clientv3 client failed: %s", err.Error())
-	}
-	_ctx, _cancel := context.WithTimeout(context.Background(), timeout)
-	r := &Resolver{serviceName: serviceName, client: client, cancel: _cancel}
-
-	conn, err := grpc.DialContext(_ctx, target, grpc.WithInsecure(), grpc.WithBalancer(grpc.RoundRobin(r)))
-	if err != nil {
-		return err
-	}
-	r.conn = conn
-
-	if defaultMapResolvers.setResolvers(serviceName, r) {
-		return nil
+		return nil, err
 	}
 
-	return fmt.Errorf("grpclib: creat clientv3 client failed: set resolver, %s", serviceName)
+	r := &etcdResolver{
+		client: client,
+		cc:     cc,
+		target: target,
+		rn:     make(chan struct{}, 1),
+
+		key: fmt.Sprintf("/%s/%s/%s", p.Scheme(), p.server, p.version),
+	}
+
+	r.ctx, r.cancel = context.WithCancel(context.Background())
+
+	go r.watcher()
+	r.ResolveNow(resolver.ResolveNowOptions{})
+
+	return r, nil
 }
 
-// Resolve to resolve the service from etcd, target is the dial address of etcd
-// target example: "http://127.0.0.1:2379,http://127.0.0.1:12379,http://127.0.0.1:22379"
-func (p *Resolver) Resolve(target string) (naming.Watcher, error) {
-	if 0 == len(p.serviceName) {
-		return nil, errors.New("grpclib: no service name provided")
+func (p *etcdResolver) Close() {
+	p.cancel()
+}
+
+func (p *etcdResolver) ResolveNow(resolver.ResolveNowOptions) {
+	select {
+	case p.rn <- struct{}{}:
+	default:
+	}
+}
+
+func (p *etcdResolver) watcher() {
+	resp, err := p.client.Get(p.ctx, p.key, clientv3.WithPrefix(), clientv3.WithSerializable())
+	if err != nil {
+		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	w := &watcher{
-		resolver: p,
-		target:   fmt.Sprintf("/%s/%s/", prefix, p.serviceName),
-		ctx:      ctx,
-		cancel:   cancel}
-	// Return watcher
-	return w, nil
+	addrs := p.extractAddrs(resp)
+	p.cc.UpdateState(resolver.State{
+		Addresses: addrs,
+	})
+	rch := p.client.Watch(context.Background(), p.key, clientv3.WithPrefix(), clientv3.WithRev(resp.Header.Revision+1))
+	t := time.NewTimer(minEtcdResRate)
+	for {
+
+		select {
+		case <-t.C:
+		case n := <-rch:
+			for _, ev := range n.Events {
+				switch ev.Type {
+				case mvccpb.PUT, mvccpb.DELETE:
+					resp, err := p.client.Get(p.ctx, p.key, clientv3.WithPrefix(), clientv3.WithSerializable())
+					if err != nil {
+						break
+					}
+
+					addrs := p.extractAddrs(resp)
+
+					p.cc.UpdateState(resolver.State{
+						Addresses: addrs,
+					})
+				}
+			}
+		case <-p.ctx.Done():
+			t.Stop()
+			return
+		}
+	}
+}
+
+func (p *etcdResolver) extractAddrs(resp *clientv3.GetResponse) []resolver.Address {
+	var adds []resolver.Address
+	for i := range resp.Kvs {
+		adds = append(adds, resolver.Address{
+			Addr: strings.TrimPrefix(string(resp.Kvs[i].Key), p.key+"/"),
+		})
+	}
+
+	return adds
 }
