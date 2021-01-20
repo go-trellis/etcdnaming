@@ -1,6 +1,6 @@
 // GNU GPL v3 License
 
-// Copyright (c) 2017 github.com:go-trellis
+// Copyright (c) 2017 github.com:iTrellis
 
 package main
 
@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-trellis/etcdnaming"
-	"github.com/go-trellis/etcdnaming/go-server/proto"
+	"github.com/iTrellis/etcdnaming"
+	"github.com/iTrellis/etcdnaming/go-server/proto"
 
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"

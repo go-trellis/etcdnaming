@@ -1,4 +1,4 @@
-module github.com/go-trellis/etcdnaming
+module github.com/iTrellis/etcdnaming
 
 go 1.13
 

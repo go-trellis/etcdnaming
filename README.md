@@ -21,7 +21,7 @@ replace github.com/coreos/go-systemd => github.com/coreos/go-systemd/v22 v22.0.0
 * last:
 
 ```golang
-go get github.com/go-trellis/etcdnaming
+go get github.com/iTrellis/etcdnaming
 ```
 
 ## Server
